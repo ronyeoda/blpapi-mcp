@@ -107,9 +107,11 @@ def _fmt_date(date_str: str) -> str:
     return date_str.replace("-", "")
 
 
-def _parse_datetime(date_str: str, time_str: str) -> blpapi.datetime:
-    d = dt.datetime.strptime(f"{date_str}T{time_str}", "%Y-%m-%dT%H:%M:%S")
-    return blpapi.datetime(d.year, d.month, d.day, d.hour, d.minute, d.second)
+def _parse_datetime(date_str: str, time_str: str) -> dt.datetime:
+    # blpapi takes a plain datetime for startDateTime/endDateTime (read as UTC).
+    # `blpapi.datetime` is a module, not a class: calling it raised
+    # "'module' object is not callable" and broke bdib/bdtick.
+    return dt.datetime.strptime(f"{date_str}T{time_str}", "%Y-%m-%dT%H:%M:%S")
 
 
 def _csv(rows: list[dict]) -> str:
@@ -908,36 +910,40 @@ def serve(args: types.StartupArgs):
             req.set("expression", query)
             session.sendRequest(req)
 
-            tables: dict = {}
+            # bqlsvc answers with ONE JSON document per message, in a string
+            # element named "result" (not a structured "results" element), e.g.
+            # {"results": {"px_last()": {"idColumn": {"values": [...]},
+            #   "valuesColumn": {"values": [...]}, "secondaryColumns": [...]}},
+            #  "responseExceptions": [{"message": ...}]}
+            rows: list[dict] = []
+            problems: list[str] = []
             for msg in _response_messages(session):
-                _raise_response_error(msg, "BQL sendQuery")
-                if not msg.hasElement("results"):
-                    continue
-                results = msg.getElement("results")
-                for i in range(results.numValues()):
-                    res = results.getValueAsElement(i)
-                    name = res.getElementAsString("name") if res.hasElement("name") else str(i)
-                    id_col = res.getElement("idColumn")
-                    id_vals = _to_value(id_col.getElement("values"))
-                    val_col = res.getElement("valuesColumn")
-                    val_vals = _to_value(val_col.getElement("values"))
-                    sec_cols: dict = {}
-                    if res.hasElement("secondaryColumns"):
-                        sc = res.getElement("secondaryColumns")
-                        for j in range(sc.numValues()):
-                            col = sc.getValueAsElement(j)
-                            col_name = col.getElementAsString("name")
-                            sec_cols[col_name] = _to_value(col.getElement("values"))
-                    rows = []
-                    for k, (id_v, val_v) in enumerate(zip(id_vals, val_vals)):
-                        row: dict = {"id": id_v, "value": val_v}
-                        for col_name, col_vals in sec_cols.items():
+                root = msg.asElement()
+                if root.isComplexType():
+                    _raise_response_error(msg, "BQL sendQuery")
+                    if not root.hasElement("result"):
+                        continue
+                    text = root.getElementAsString("result")
+                else:
+                    text = root.getValueAsString()
+                doc = json.loads(text) if text else {}
+                problems += [x.get("message", "BQL error") for x in doc.get("responseExceptions") or []]
+                for key, res in (doc.get("results") or {}).items():
+                    name = res.get("name", key)
+                    ids = (res.get("idColumn") or {}).get("values") or []
+                    vals = (res.get("valuesColumn") or {}).get("values") or []
+                    sec_cols = [(c.get("name", "col"), c.get("values") or []) for c in res.get("secondaryColumns") or []]
+                    for k, (id_v, val_v) in enumerate(zip(ids, vals)):
+                        row: dict = {"field": name, "id": id_v, "value": val_v}
+                        for col_name, col_vals in sec_cols:
                             row[col_name] = col_vals[k] if k < len(col_vals) else None
                         rows.append(row)
-                    tables[name] = rows
-
-            rows = [{"field": fname, **row} for fname, field_rows in tables.items() for row in field_rows]
-            return _csv(rows)
+            if problems and not rows:
+                raise RuntimeError("BQL: " + "; ".join(problems))
+            out = _csv(rows)
+            if problems:
+                out = "# BQL warnings: " + "; ".join(problems) + "\n" + out
+            return out
         finally:
             session.stop()
 

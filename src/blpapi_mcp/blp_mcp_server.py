@@ -11,6 +11,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.logging import get_logger
 
 from . import types
+from . import usage_meter
 
 
 _REFDATA      = "//blp/refdata"
@@ -116,6 +117,7 @@ def _parse_datetime(date_str: str, time_str: str) -> dt.datetime:
 
 def _csv(rows: list[dict]) -> str:
     """Serialize a list of dicts to CSV. Token-efficient format for LLMs."""
+    usage_meter.capture(rows)
     if not rows:
         return ""
     keys = []
@@ -250,6 +252,7 @@ _READ_ONLY_HINTS = {
 
 def serve(args: types.StartupArgs):
     mcp = FastMCP("blpapi_mcp", host=args.host, port=args.port)
+    usage_meter.meter_tools(mcp)  # one line per tool call for jarvis's Bloomberg usage page
     logger = get_logger(__name__)
     logger.info("startup args:" + str(args))
     logger.info("blpapi version:" + blpapi.version())  # type: ignore
